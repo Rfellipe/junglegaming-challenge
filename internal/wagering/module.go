@@ -10,7 +10,11 @@ import (
 	"junglegaming/challenge/internal/postgres"
 )
 
-var Module = fx.Module("wagering", fx.Provide(func(db *postgres.Database) *Service { return New(db.Pool) }), fx.Invoke(startReferenceWorker))
+var Module = fx.Module("wagering", fx.Provide(func(db *postgres.Database, logger *slog.Logger) *Service {
+	s := New(db.Pool)
+	s.Logger = logger
+	return s
+}), fx.Invoke(startReferenceWorker))
 
 func startReferenceWorker(lc fx.Lifecycle, service *Service, logger *slog.Logger) {
 	var cancel context.CancelFunc

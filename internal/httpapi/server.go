@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"junglegaming/challenge/internal/config"
 	"junglegaming/challenge/internal/messaging"
 	"junglegaming/challenge/internal/postgres"
+	"junglegaming/challenge/internal/telemetry"
 	"junglegaming/challenge/internal/wagering"
 )
 
@@ -60,8 +62,31 @@ func New(lc fx.Lifecycle, c config.Config, pool *postgres.Database, queues *mess
 	s := &Server{done: make(chan struct{})}
 	mux := http.NewServeMux()
 	mux.Handle("/health/", HealthHandler(c.DependencyTimeout, map[string]Check{"postgres": pool.Ping, "sqs": queues.Check}, s.stopping.Load))
+	mux.Handle("GET /metrics", authenticator.Authenticate(auth.RequireInternal(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), c.DependencyTimeout)
+		defer cancel()
+		var pending int64
+		var lag float64
+		err := pool.Pool().QueryRow(ctx, `SELECT count(*),COALESCE(EXTRACT(EPOCH FROM now()-min(occurred_at)),0)::float8 FROM wagering.outbox WHERE published_at IS NULL`).Scan(&pending, &lag)
+		if err != nil {
+			respond(w, 503, map[string]string{"error": "temporarily_unavailable"})
+			return
+		}
+		depth, err := queues.QueueDepth(ctx, c.QueueNames[1])
+		if err != nil {
+			respond(w, 503, map[string]string{"error": "temporarily_unavailable"})
+			return
+		}
+		financial.Metrics.ServeHTTP(w, r)
+		fmt.Fprintf(w, "jungle_dlq_messages %d\n", depth)
+		fmt.Fprintf(w, "jungle_outbox_pending %d\njungle_outbox_oldest_seconds %g\n", pending, lag)
+	}))))
 	mux.Handle("/", FinanceHandler(authenticator, financial, c.DependencyTimeout))
-	s.HTTP = &http.Server{Addr: c.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 2*c.DependencyTimeout + time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	s.HTTP = &http.Server{Addr: c.HTTPAddr, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		correlation := wagering.ID()
+		w.Header().Set("X-Correlation-ID", correlation)
+		observe(logger, mux).ServeHTTP(w, r.WithContext(telemetry.WithCorrelation(r.Context(), correlation)))
+	}), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 2*c.DependencyTimeout + time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			ln, err := net.Listen("tcp", c.HTTPAddr)

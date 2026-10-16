@@ -46,7 +46,7 @@ Cada operação nova obtém `SELECT ... FOR UPDATE` na carteira antes de avaliar
 
 O schema impõe unicidade de jogador/moeda, provedor/ID externo, provedor/chave, OPENING por carteira e carteira/transação no ledger. FKs compostas mantêm carteira, jogador, moeda e valor coerentes. CHECKs impedem saldo negativo e valores financeiros inválidos. Triggers protegem identidade/versão da carteira, transações terminais, o payload dos eventos e o ledger contra UPDATE, DELETE e TRUNCATE. O append valida o saldo anterior contra o lançamento anterior e o saldo posterior/versão contra a carteira bloqueada. Constraints diferidas verificam a soma do ledger e a correspondência entre operação processada e lançamento antes de confirmar o commit.
 
-As verificações do saldo por soma têm custo proporcional ao histórico da carteira e favorecem a auditabilidade deste desafio; otimizações futuras precisam preservar a mesma garantia. O usuário local do banco é administrativo: as proteções valem para SQL comum, mas não pretendem impedir um administrador de desabilitar triggers. Permissões de produção continuam pendentes.
+As verificações do saldo por soma têm custo proporcional ao histórico da carteira e favorecem a auditabilidade deste desafio. O usuário local do banco é administrativo: as proteções valem para SQL comum, mas não pretendem impedir um administrador de desabilitar triggers.
 
 ## Idempotência e estados
 
@@ -56,7 +56,7 @@ Chave, identidade externa e hash precisam coincidir para replay. Reutilizar chav
 
 Transições: `PENDING → PROCESSED | REJECTED | FAILED | PENDING_REFERENCE`; `PENDING_REFERENCE → PENDING_REFERENCE | PROCESSED | REJECTED | FAILED`. Esperar referência exige uma referência externa. Estados terminais são imutáveis. OPENING interno já é criado em PROCESSED. Operações independentes não confirmam PENDING intermediário: terminam no mesmo commit ou sofrem rollback. O banco rejeita um PENDING confirmado, pois não há worker genérico para retomá-lo.
 
-Rejeições de domínio são persistidas como REJECTED com evento. Erros de banco, cancelamento e indisponibilidade são transitórios nesta etapa: rollback e HTTP 503, com retry pela mesma chave. FAILED é um estado previsto e validado pelo domínio/schema, mas ainda não é emitido por este caminho HTTP, que não transforma uma falha de infraestrutura não confirmada em resultado terminal.
+Rejeições de domínio são persistidas como REJECTED com evento. Erros de banco, cancelamento e indisponibilidade são transitórios: rollback e HTTP 503, com retry pela mesma chave. FAILED é um estado previsto e validado pelo domínio/schema, mas não é emitido por este caminho HTTP, que não transforma uma falha de infraestrutura não confirmada em resultado terminal.
 
 ## Referências e reversões
 
@@ -85,7 +85,7 @@ O polling ocorre a cada 500 ms, com até 32 operações por ciclo e timeout de 5
 
 Todos esses resultados são definitivos para aquela operação: replay não tenta novamente. Entradas estruturalmente inválidas retornam 400 sem operação persistida; podem ser corrigidas antes do primeiro aceite. Após aceite, uma operação diferente exige nova identidade/chave e continua sujeita às regras financeiras.
 
-## Outbox nesta etapa
+## Outbox
 
 Construtores concretos fixam tipo e versão 1 dos eventos WagerTransactionProcessed, WagerTransactionRejected, WagerTransactionPendingReference e WalletBalanceChanged. Os envelopes usam IDs UUID estáveis, aggregateId, correlationId igual ao ID da operação, UTC/RFC 3339 e Money em strings; causationId é opcional e omitido. Eventos de abertura omitem metadados externos inaplicáveis. WalletBalanceChanged inclui direção, valor, saldo anterior/posterior e versão da carteira. LOSS emite apenas o evento de processamento.
 
@@ -105,14 +105,62 @@ O script de recuperação interrompe as dependências e verifica a retomada da A
 
 A configuração local passou a validar conexões antes de reutilizá-las, por uma propriedade do Quarkus. As métricas do Keycloak também estão habilitadas para incluir o banco na verificação de readiness. Como a propriedade direta do Quarkus não faz parte da configuração oficialmente suportada pelo Keycloak, ela precisa ser revalidada ao atualizar a imagem. Referências: [configuração do Keycloak](https://www.keycloak.org/server/configuration) e [fontes de dados do Quarkus](https://quarkus.io/guides/all-config/#quarkus-agroal_quarkus-datasource-jdbc-validate-on-borrow).
 
-## Próxima etapa e limitações
+## Entrega e limitações
 
-As etapas 1–6 estão implementadas. Consultas por ID interno e externo filtram provider_id no SQL. Ledger usa cursor vinculado à carteira e wallet_version crescente, único por carteira. Reconciliação usa uma única instrução SQL para obter visão MVCC consistente e calcular armazenado menos créditos líquidos, sem mutações.
+Os fluxos financeiros, mensageria e recuperação estão implementados. Consultas por ID interno e externo filtram provider_id no SQL. Ledger usa cursor vinculado à carteira e wallet_version crescente, único por carteira. Reconciliação usa uma única instrução SQL para obter visão MVCC consistente e calcular armazenado menos créditos líquidos, sem mutações.
 
 O SQS compartilha Process com HTTP. A inbox bloqueia por (consumer_name,message_id), valida hash SHA-256 do envelope tipado normalizado e registra conclusão junto com domínio e outbox. Alterações de conteúdo sob a mesma identidade retornam conflito e seguem para DLQ. Entregas confirmadas incrementam deliveries. Tentativas de processamento têm prazo de 5 segundos, visibilidade de 30 segundos e backoff transitório de 2 a 16 segundos; mensagens permanentes aguardam 2 segundos. Redrive ocorre após cinco recebimentos. Publisher usa backoff exponencial até 256 segundos, sem descartar eventos.
 
 O Fx encerra HTTP e workers antes de fechar clientes e banco. Cancelamento desfaz transações não confirmadas; falhas de DeleteMessage deixam mensagens recuperáveis. Leases expiram após interrupção abrupta. Output usa grupo por carteira e deduplicação por eventId; publishers concorrentes não garantem ordenação financeira de eventos. O contrato é pelo menos uma vez.
 
-A integração usa três processos independentes, tokens reais e barreiras injetadas exclusivamente no teste para SIGKILL nos pontos de commit, claim e publicação. PostgreSQL e LocalStack verificam efeitos, inbox, leases, retries e DLQ. Veja scripts/check-distributed.sh e README.md para reprodução. Métricas financeiras e logs correlacionados completos permanecem na etapa 7.
+A integração usa três processos independentes, tokens reais e barreiras injetadas exclusivamente no teste para SIGKILL nos pontos de commit, claim e publicação. PostgreSQL e LocalStack verificam efeitos, inbox, leases, retries e DLQ. Veja scripts/check-distributed.sh e README.md para reprodução. A observabilidade financeira está descrita abaixo.
 
 Os modelos IAM e scripts/setup-broker-access.sh provisionam produtor confiável e worker com permissões distintas. LocalStack não comprova autorização IAM. A fila compartilhada pressupõe produtores confiáveis; providerId do corpo não é autenticado por IAM. Para produtores externos não confiáveis, exigir gateway autenticado ou filas por provedor. Produção também exige TLS, gestão de credenciais e permissões restritas no banco.
+
+## Observabilidade
+
+O serviço financeiro possui um registro de métricas por processo, protegido por mutex, sem dependência de frameworks. Os labels são estados de um conjunto fechado; identificadores não entram nas séries. A latência usa soma/contagem em segundos. Contadores de tentativas não são auditoria financeira: podem se perder no crash após commit ou contar replays. A auditoria durável continua no ledger/inbox/outbox.
+
+O HTTP gera `X-Correlation-ID` UUID por requisição e propaga pelo contexto até o serviço. Logs JSON registram IDs disponíveis, resultado, replay e failureCode, sem tokens, credenciais, payloads completos ou erros SQL brutos. A resolução de referências usa o ID da transação para correlação; publicações registram eventId, walletId, tentativa e confirmação. IDs externos são tratados como dados pelo encoder JSON, sem interpolação em linhas de log.
+
+`GET /metrics` passa pela autenticação e autorização interna. Consulta backlog/idade da outbox confirmada e profundidade visível aproximada da DLQ com timeout compartilhado; falhas retornam 503. Esses gauges refletem o banco/broker compartilhado e não devem ser somados entre instâncias. Contadores e soma/contagem de latência devem ser agregados entre processos. A diferença de reconciliação fica na resposta e no log em unidades mínimas; a métrica registra o número de divergências. Não há exporter externo, dashboards, alertas, histogramas de percentis ou tracing nesta entrega.
+
+O catálogo de métricas e comandos de release está no README; RELEASE.md registra os checks executados. Os quatro eventos tipados de versão 1 e todos os failureCode estão definidos acima e em internal/domain/event.go. Todos os eventos vão para wager-events.fifo, com grupo por carteira e deduplicação por eventId. O evento de transação usa aggregateId=transactionId; WalletBalanceChanged usa aggregateId=walletId. occurredAt é UTC, Money é {amount,currency}, e causationId é omitido quando não disponível. Consumidores devem deduplicar eventId persistentemente e tolerar repetição e ordem de publicação diferente da versão financeira.
+
+### Dados dos eventos de saída (version=1)
+
+Todos os campos abaixo são JSON camelCase. O bloco comum de transação contém `transactionId`, `walletId`, `playerId`, `kind`, `money` e, para operações externas, `providerId`, `externalTransactionId`, `roundId`, `gameId`. Cada Money tem `amount` string decimal de duas casas e `currency`.
+
+| eventType | Gatilho | data |
+| --- | --- | --- |
+| WagerTransactionProcessed | Operação confirmada em PROCESSED, inclusive OPENING positivo e LOSS | Bloco comum + balance (saldo original de processamento) |
+| WagerTransactionRejected | Rejeição definitiva, inclusive expiração da referência | Bloco comum + failureCode |
+| WagerTransactionPendingReference | Primeiro aceite pendente; retries não repetem esse evento | Bloco comum + referenceExternalTransactionId |
+| WalletBalanceChanged | Movimento positivo confirmado, inclusive abertura; LOSS não emite | walletId, transactionId, direction (CREDIT/DEBIT), money, balanceBefore, balanceAfter, walletVersion |
+
+Envelope ilustrativo:
+
+```json
+{
+  "eventId": "0192f28f-5dc0-4d58-bdb2-814ad6a0f4a1",
+  "eventType": "WagerTransactionProcessed",
+  "aggregateId": "0192f28f-5dc0-4d58-bdb2-814ad6a0f4a2",
+  "correlationId": "0192f28f-5dc0-4d58-bdb2-814ad6a0f4a2",
+  "occurredAt": "2026-10-16T14:00:00Z",
+  "version": 1,
+  "data": {
+    "transactionId": "0192f28f-5dc0-4d58-bdb2-814ad6a0f4a2",
+    "walletId": "0192f28f-5dc0-4d58-bdb2-814ad6a0f4a3",
+    "playerId": "0192f28f-5dc0-4d58-bdb2-814ad6a0f4a4",
+    "providerId": "provider-a",
+    "externalTransactionId": "bet-1",
+    "roundId": "round-1",
+    "gameId": "game-1",
+    "kind": "BET",
+    "money": {"amount": "25.00", "currency": "BRL"},
+    "balance": {"amount": "75.00", "currency": "BRL"}
+  }
+}
+```
+
+Os IDs do exemplo são ilustrativos. A serialização real pode incluir frações de segundo em occurredAt. Consumidores devem validar eventType/version, tolerar campos adicionais compatíveis e encaminhar versões desconhecidas para tratamento próprio sem reaplicar efeitos financeiros. Não há roteamento distinto por tipo: todos os tipos compartilham a fila de saída.

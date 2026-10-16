@@ -542,4 +542,18 @@ func TestThreeProcessRecovery(t *testing.T) {
 		})
 		assertWallet(w, 10000, 3)
 	})
+	waitOutbox()
+	var discrepancies, pending, leased int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM wagering.wallets w WHERE w.balance::numeric <> (SELECT COALESCE(sum(CASE direction WHEN 'CREDIT' THEN amount::numeric ELSE -amount::numeric END),0) FROM wagering.ledger WHERE wallet_id=w.id)`).Scan(&discrepancies); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM wagering.transactions WHERE status IN ('PENDING','PENDING_REFERENCE')`).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM wagering.outbox WHERE lease_token IS NOT NULL OR published_at IS NULL`).Scan(&leased); err != nil {
+		t.Fatal(err)
+	}
+	if discrepancies != 0 || pending != 0 || leased != 0 {
+		t.Fatalf("recovery left discrepancies=%d pending=%d outbox=%d", discrepancies, pending, leased)
+	}
 }

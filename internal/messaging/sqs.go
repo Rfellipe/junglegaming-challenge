@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -67,4 +68,17 @@ func (c *Client) Check(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// QueueDepth reports the broker's approximate visible queue depth.
+func (c *Client) QueueDepth(ctx context.Context, name string) (int64, error) {
+	q, err := c.api.GetQueueUrl(ctx, &sqs.GetQueueUrlInput{QueueName: aws.String(name)})
+	if err != nil {
+		return 0, err
+	}
+	a, err := c.api.GetQueueAttributes(ctx, &sqs.GetQueueAttributesInput{QueueUrl: q.QueueUrl, AttributeNames: []types.QueueAttributeName{types.QueueAttributeNameApproximateNumberOfMessages}})
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(a.Attributes["ApproximateNumberOfMessages"], 10, 64)
 }

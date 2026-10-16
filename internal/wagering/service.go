@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"time"
@@ -18,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"junglegaming/challenge/internal/domain"
+	"junglegaming/challenge/internal/telemetry"
 )
 
 var (
@@ -25,10 +27,16 @@ var (
 	ErrNotFound = errors.New("wallet not found")
 )
 
-type Service struct{ pool func() *pgxpool.Pool }
+type Service struct {
+	pool    func() *pgxpool.Pool
+	Metrics *telemetry.Metrics
+	Logger  *slog.Logger
+}
 
 // A pool accessor permits Fx construction before the database lifecycle starts.
-func New(pool func() *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func New(pool func() *pgxpool.Pool) *Service {
+	return &Service{pool: pool, Metrics: telemetry.New(), Logger: slog.Default()}
+}
 
 func ID() string {
 	var b [16]byte
@@ -265,7 +273,33 @@ func (s *Service) ProcessMessage(ctx context.Context, r Request, key, messageID,
 	}
 	return s.process(ctx, r, key, messageID, hash)
 }
-func (s *Service) process(ctx context.Context, r Request, key, messageID, messageHash string) (Result, error) {
+func (s *Service) process(ctx context.Context, r Request, key, messageID, messageHash string) (result Result, resultErr error) {
+	started := time.Now()
+	defer func() {
+		outcome := "error"
+		if resultErr == nil {
+			outcome = string(result.Status)
+		}
+		s.Metrics.Add(`transactions_total{status="`+outcome+`"}`, 1)
+		s.Metrics.Add("processing_seconds_sum", time.Since(started).Seconds())
+		s.Metrics.Add("processing_seconds_count", 1)
+		if result.IdempotentReplay {
+			s.Metrics.Add("duplicates_total", 1)
+		}
+		if errors.Is(resultErr, ErrConflict) {
+			s.Metrics.Add("concurrency_conflicts_total", 1)
+		}
+		// Only identifiers and fixed outcomes are recorded; errors can contain SQL data.
+		correlation := telemetry.Correlation(ctx)
+		if correlation == "" {
+			correlation = result.TransactionID
+		}
+		if correlation == "" {
+			correlation = messageID
+		}
+		s.Logger.Info("transaction attempt", "correlationId", correlation, "messageId", messageID, "transactionId", result.TransactionID, "walletId", r.WalletID, "providerId", r.ProviderID, "status", outcome, "failureCode", result.FailureCode, "replay", result.IdempotentReplay)
+	}()
+
 	if err := r.Validate(key); err != nil {
 		return Result{}, err
 	}
@@ -535,7 +569,13 @@ func (s *Service) RetryReference(ctx context.Context) (bool, error) {
 		if err = s.apply(ctx, tx, &o, w, time.Now().UTC(), true); err != nil {
 			return false, err
 		}
-		return true, tx.Commit(ctx)
+		err = tx.Commit(ctx)
+		if err == nil {
+			s.Metrics.Add("reference_retries_total", 1)
+			s.Metrics.Add(`reference_outcomes_total{status="`+string(o.status)+`"}`, 1)
+			s.Logger.Info("reference retry", "correlationId", o.id, "transactionId", o.id, "walletId", c.wallet, "providerId", o.request.ProviderID, "status", o.status, "failureCode", o.failure)
+		}
+		return true, err
 	}
 	return false, nil
 }

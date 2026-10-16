@@ -93,11 +93,26 @@ func TestFinancialHTTPAndWorkerLifecycle(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer res.Body.Close()
+		if !wagering.ValidID(res.Header.Get("X-Correlation-ID")) {
+			t.Fatal("missing server correlation ID")
+		}
 		data, err := io.ReadAll(res.Body)
 		if err != nil {
 			t.Fatal(err)
 		}
 		return res.StatusCode, data
+	}
+	for _, tc := range []struct {
+		bearer string
+		want   int
+	}{{"", 401}, {provider, 403}, {internal, 200}} {
+		status, body := call("GET", "/metrics", tc.bearer, "", nil)
+		if status != tc.want {
+			t.Fatalf("metrics authorization: %d: %s", status, body)
+		}
+		if status == 200 && !bytes.Contains(body, []byte("jungle_outbox_pending")) {
+			t.Fatalf("missing outbox gauge: %s", body)
+		}
 	}
 	initial := map[string]any{"playerId": wagering.ID(), "initialBalance": map[string]string{"amount": "100.00", "currency": "BRL"}}
 	for _, bearer := range []string{"", "invalid", provider} {
@@ -173,6 +188,15 @@ func TestFinancialHTTPAndWorkerLifecycle(t *testing.T) {
 	changed.Money, _ = domain.Parse("80.00", "BRL")
 	if status, _ := call("POST", "/wagering/transactions", provider, changed.ExternalID, changed); status != 422 {
 		t.Fatal("business rejection", status)
+	}
+	status, metrics := call("GET", "/metrics", internal, "", nil)
+	if status != 200 {
+		t.Fatalf("metrics scrape: %d: %s", status, metrics)
+	}
+	for _, metric := range []string{`jungle_duplicates_total 1`, `jungle_concurrency_conflicts_total 1`, `jungle_transactions_total{status="REJECTED"} 1`, `jungle_processing_seconds_count`, `jungle_dlq_messages`} {
+		if !bytes.Contains(metrics, []byte(metric)) {
+			t.Fatalf("missing %s in %s", metric, metrics)
+		}
 	}
 	// Accept a reference wait, stop all application components, create its original
 	// using separate connections, and let a fresh Fx worker finish the durable work.

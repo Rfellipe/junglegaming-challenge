@@ -126,5 +126,11 @@ func (s *Service) Reconcile(ctx context.Context, id string) (Reconciliation, err
 	out.CalculatedBalance, _ = domain.FromMinor(calculated, currency)
 	out.Difference, _ = domain.FromMinor(difference, currency)
 	out.Consistent = difference == 0
+	s.Metrics.Add("reconciliations_total", 1)
+	if difference != 0 {
+		s.Metrics.Add("reconciliation_mismatches_total", 1)
+	}
+	s.Logger.Info("wallet reconciliation", "walletId", id, "consistent", out.Consistent, "differenceMinor", difference)
+
 	return out, nil
 }

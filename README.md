@@ -220,7 +220,7 @@ Com PostgreSQL, Keycloak e LocalStack reais:
 
 ```sh
 docker compose up --detach --wait postgres keycloak localstack
-go test -tags=integration -race -count=1 -timeout=3m ./...
+go test -tags=integration -race -count=1 -timeout=5m ./...
 ```
 
 Os testes de integração cobrem migrations, configuração das filas e da DLQ, autenticação, isolamento de provedores, expiração de tokens, falhas de inicialização, readiness e encerramento com requisições em andamento. O teste de expiração leva cerca de um minuto.
@@ -230,8 +230,8 @@ Também cobrem abertura, operações financeiras, replays após novas movimenta�
 Para executar somente os novos testes financeiros:
 
 ```sh
-go test -tags=integration -race -count=1 -timeout=3m ./internal/wagering
-go test -tags=integration -race -count=1 -timeout=3m ./integration -run TestFinancialHTTPAndWorkerLifecycle
+go test -tags=integration -race -count=1 -timeout=5m ./internal/wagering
+go test -tags=integration -race -count=1 -timeout=5m ./integration -run TestFinancialHTTPAndWorkerLifecycle
 ```
 
 As migrations são testadas em um banco temporário. A conta precisa de permissão para criar e excluir esse banco; a configuração local já permite isso. Use um ambiente descartável. Para mudar os endereços dos testes, defina `TEST_DATABASE_URL`, `TEST_OIDC_ISSUER_URL`, `TEST_OIDC_BACKCHANNEL_URL` e `TEST_SQS_ENDPOINT`.
@@ -247,13 +247,13 @@ O script para LocalStack e PostgreSQL, um por vez, e verifica se a readiness pas
 
 Para conferir o encerramento por SIGTERM, execute `docker compose stop app` e consulte os logs. Depois, reinicie com `docker compose up --detach --wait app`.
 
-## O que falta
+## Validação e limitações
 
-As etapas 1–6 de [MILESTONES.md](MILESTONES.md) estão implementadas. Métricas financeiras e logs correlacionados completos permanecem na etapa 7; a revisão final de entrega permanece na etapa 8.
+O registro reproduzível de validação e as limitações estão em [RELEASE.md](RELEASE.md).
 
 O ambiente usa HTTP e credenciais locais. TLS, gestão/rotação de credenciais e validação de IAM na AWS continuam sendo responsabilidades de produção. LocalStack não comprova isolamento IAM.
 
-## Consultas e contrato HTTP (etapa 4)
+## Consultas e contrato HTTP
 
 As consultas `GET /wagering/transactions/{transactionId}` e `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` exigem token do provedor proprietário. A primeira filtra o provedor no SQL e responde 404 para IDs de outro provedor; a segunda responde 403 se o provedor da rota difere do token. O corpo inclui os campos do pedido, transactionId, status, balance, failureCode quando aplicável, idempotentReplay=false, createdAt e updatedAt. Para pendências sem resultado financeiro, balance é zero; não representa saldo de processamento confirmado.
 
@@ -275,7 +275,7 @@ As consultas `GET /wagering/transactions/{transactionId}` e `GET /providers/{pro
 
 Uma consulta bem-sucedida retorna 200 mesmo para uma transação rejeitada ou pendente. O POST conserva a chave enviada e o saldo original nos replays de operações concluídas. Os códigos de negócio estão em ARCHITECTURE.md.
 
-## Inbox, publicação e credenciais (etapa 5)
+## Inbox, publicação e credenciais
 
 Envie o envelope de CHALLENGE.md com type=WagerTransactionRequested, messageId, occurredAt RFC3339 e data contendo o pedido financeiro mais idempotencyKey. JSON desconhecido, envelopes maiores que 16 KiB e valores inválidos são retidos para DLQ. messageId identifica a inbox `wagering-v1`; SHA-256 do envelope tipado serializado detecta mudanças de conteúdo, chave e metadados. A formatação JSON não afeta o hash. Reenvie exatamente o mesmo envelope nas reentregas.
 
@@ -294,7 +294,7 @@ Para provisionar usuários e políticas locais de produtor e worker:
 
 O segundo comando cria uma chave e grava a resposta com modo 600. Os modelos em deploy/aws restringem o produtor a SendMessage/GetQueueUrl na entrada e o worker a leitura/remoção da entrada e envio à saída. Para AWS, substitua região/conta e associe essas permissões a roles com credenciais temporárias. O acesso de entrada é reservado a produtores confiáveis: IAM na fila compartilhada não valida o providerId no JSON. Não conceda envio direto a provedores não confiáveis sem gateway autenticado ou filas isoladas. As credenciais test usadas pelo Compose não validam IAM; o script demonstra o provisionamento, e os testes financeiros não alegam verificar autorização AWS.
 
-## Três processos e recuperação (etapa 6)
+## Três processos e recuperação
 
 ```sh
 ./scripts/check-distributed.sh
@@ -303,3 +303,35 @@ go test -tags=integration -race -count=1 -timeout=5m ./...
 ```
 
 O runner cria banco e filas temporários e inicia três processos reais com portas efêmeras distintas e pools independentes. Usa tokens reais do Keycloak e pausa/retoma brevemente o container LocalStack para comprovar recuperação da outbox durante indisponibilidade do broker. Exercita 50 replays, duas apostas concorrentes de 80.00, isolamento de locks, HTTP/SQS, reentrega comprovada pelo contador da inbox, poison/DLQ, reinício e referências. Barreiras injetadas apenas no binário de testes interrompem o processo após commit/antes de delete, após claim/antes de SendMessage e após SendMessage/antes de confirmação. O teste envia SIGKILL ao processo que atingiu a barreira e aguarda recuperação por outro publisher após expirar o lease. Confere saldo, ledger, resultado persistido, inbox e outbox. Não há endpoint ou variável de aplicação que ative essas barreiras.
+
+## Observabilidade e release
+
+Os logs JSON incluem IDs disponíveis de correlação, mensagem, transação, carteira e provedor, status e failureCode. Cada requisição recebe um UUID novo em `X-Correlation-ID`; eventos usam o ID da transação como correlationId. Não são registrados tokens, credenciais, chaves de idempotência ou corpos completos. A aplicação não aceita um correlationId arbitrário do cliente. Tentativas financeiras são registradas após a execução, incluindo replays e erros; um log não substitui o resultado durável do banco.
+
+```sh
+INTERNAL_TOKEN=$(scripts/token.sh internal-service)
+curl --fail-with-body http://localhost:8080/metrics \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+./scripts/check-release.sh
+```
+
+`GET /metrics` usa o formato textual Prometheus e exige token interno (401 sem token, 403 para provedor). Os contadores são locais a cada processo, começam do zero no reinício e aparecem após o primeiro evento. Colete todas as instâncias. Não há IDs de usuário/carteira/provedor nos labels. Métricas disponíveis:
+
+| Métrica (`jungle_`) | Significado |
+| --- | --- |
+| transactions_total{status} | Tentativas HTTP/SQS por estado confirmado ou error, incluindo replays |
+| duplicates_total | Replays reconhecidos pelo serviço |
+| concurrency_conflicts_total | Conflitos de identidade/chave, inclusive disputas concorrentes |
+| processing_seconds_sum / processing_seconds_count | Tempo total e número de tentativas financeiras; razão = média |
+| reference_retries_total / reference_outcomes_total{status} | Retries confirmados e seu estado resultante |
+| input_deliveries_total / input_retries_total / input_invalid_total | Recebimentos, adiamentos e adiamentos permanentes para redrive |
+| outbox_retries_total | Tentativas de envio à saída que falharam |
+| outbox_pending / outbox_oldest_seconds | Quantidade e idade do evento confirmado mais antigo ainda não publicado, globais no banco |
+| dlq_messages | Profundidade visível aproximada da DLQ informada pelo SQS |
+| reconciliations_total / reconciliation_mismatches_total | Reconciliações concluídas e divergências detectadas |
+
+Falhas ao consultar banco ou DLQ fazem o scrape retornar 503. A diferença exata de reconciliação, em unidades mínimas, fica no log interno e na resposta de reconciliação; a métrica conta divergências sem criar uma série por carteira. A profundidade da DLQ é uma estimativa atual, não um contador de transferências históricas. Um scrape não remove mensagens. O IAM do worker precisa permitir GetQueueAttributes na DLQ.
+
+Os contratos de todos os eventos de saída, seus campos e um envelope de exemplo estão em [ARCHITECTURE.md](ARCHITECTURE.md#dados-dos-eventos-de-saída-version1).
+
+O gate completo usa build tag `integration`, race detector e timeout de cinco minutos por pacote. Inclui os três processos e SIGKILL nas barreiras de commit/claim/publicação; o teste de expiração real leva cerca de um minuto. `scripts/check-recovery.sh` executa separadamente a interrupção e recuperação das dependências. Consulte RELEASE.md antes de considerar uma execução validada.

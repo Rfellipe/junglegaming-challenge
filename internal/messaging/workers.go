@@ -98,6 +98,7 @@ func startWorkers(lc fx.Lifecycle, c config.Config, client *Client, service *wag
 					continue
 				}
 				for _, message := range batch.Messages {
+					service.Metrics.Add("input_deliveries_total", 1)
 					e, hash, err := DecodeInput(aws.ToString(message.Body))
 					permanent := err != nil
 					if err == nil {
@@ -123,7 +124,11 @@ func startWorkers(lc fx.Lifecycle, c config.Config, client *Client, service *wag
 							visibility = 0
 						}
 						_, _ = client.api.ChangeMessageVisibility(cleanup, &sqs.ChangeMessageVisibilityInput{QueueUrl: input.QueueUrl, ReceiptHandle: message.ReceiptHandle, VisibilityTimeout: visibility})
-						logger.Warn("input deferred", "errorClass", "processing")
+						service.Metrics.Add("input_retries_total", 1)
+						if permanent {
+							service.Metrics.Add("input_invalid_total", 1)
+						}
+						logger.Warn("input deferred", "errorClass", "processing", "messageId", e.MessageID, "walletId", e.Data.WalletID, "providerId", e.Data.ProviderID)
 					}
 					stop()
 				}
@@ -146,6 +151,10 @@ func startWorkers(lc fx.Lifecycle, c config.Config, client *Client, service *wag
 					finish, finishCancel := context.WithTimeout(context.Background(), 2*time.Second)
 					completeErr := service.CompleteEvent(finish, p, err == nil)
 					finishCancel()
+					if err != nil {
+						service.Metrics.Add("outbox_retries_total", 1)
+					}
+					logger.Info("outbox publication", "eventId", p.EventID, "walletId", p.WalletID, "attempt", p.Attempts, "published", err == nil, "confirmed", completeErr == nil)
 					if completeErr != nil {
 						logger.Warn("outbox completion deferred")
 					}
