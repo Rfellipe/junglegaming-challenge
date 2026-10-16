@@ -16,6 +16,7 @@ import (
 	"junglegaming/challenge/internal/config"
 	"junglegaming/challenge/internal/messaging"
 	"junglegaming/challenge/internal/postgres"
+	"junglegaming/challenge/internal/wagering"
 )
 
 var Module = fx.Module("http", fx.Provide(New), fx.Invoke(func(*Server) {}))
@@ -55,9 +56,12 @@ func HealthHandler(timeout time.Duration, checks map[string]Check, stopping func
 	return mux
 }
 
-func New(lc fx.Lifecycle, c config.Config, pool *postgres.Database, queues *messaging.Client, logger *slog.Logger, shutdown fx.Shutdowner, _ *auth.Authenticator) *Server {
+func New(lc fx.Lifecycle, c config.Config, pool *postgres.Database, queues *messaging.Client, logger *slog.Logger, shutdown fx.Shutdowner, authenticator *auth.Authenticator, financial *wagering.Service) *Server {
 	s := &Server{done: make(chan struct{})}
-	s.HTTP = &http.Server{Addr: c.HTTPAddr, Handler: HealthHandler(c.DependencyTimeout, map[string]Check{"postgres": pool.Ping, "sqs": queues.Check}, s.stopping.Load), ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 2*c.DependencyTimeout + time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	mux := http.NewServeMux()
+	mux.Handle("/health/", HealthHandler(c.DependencyTimeout, map[string]Check{"postgres": pool.Ping, "sqs": queues.Check}, s.stopping.Load))
+	mux.Handle("/", FinanceHandler(authenticator, financial, c.DependencyTimeout))
+	s.HTTP = &http.Server{Addr: c.HTTPAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 2*c.DependencyTimeout + time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	lc.Append(fx.Hook{
 		OnStart: func(context.Context) error {
 			ln, err := net.Listen("tcp", c.HTTPAddr)

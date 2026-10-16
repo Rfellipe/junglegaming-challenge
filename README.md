@@ -2,7 +2,7 @@
 
 Serviço de processamento de apostas com Go e Uber Fx. O enunciado está em [CHALLENGE.md](CHALLENGE.md) e as decisões técnicas em [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Por enquanto, estão prontos o ambiente local, as migrations, a autenticação e os endpoints de saúde. As operações financeiras entram na próxima etapa.
+Estão implementados o ambiente local, autenticação, saúde, domínio financeiro, abertura e consulta de carteiras, processamento HTTP dos cinco tipos externos, ledger, idempotência persistente e retomada de referências pendentes. Os eventos são gravados na outbox junto com as alterações financeiras; consumo e publicação SQS entram na próxima etapa.
 
 ## Executar o projeto
 
@@ -103,7 +103,56 @@ docker compose up --detach app
 
 Fora do Docker, os comandos são `go run ./cmd/migrate up` e `go run ./cmd/migrate down`, com as variáveis de ambiente carregadas.
 
-A migration inicial cria o schema `wagering`. A reversão usa `RESTRICT` para não excluir tabelas que venham a ser adicionadas. As versões ficam em `public.schema_migrations`. Se uma migration falhar e ficar marcada como `dirty`, confira o SQL e o estado do banco antes de corrigir a versão. Não há reset automático.
+A primeira migration cria o schema `wagering`; a segunda cria as tabelas financeiras, inbox, outbox e proteções do banco. Reverter a segunda remove essas tabelas e seus dados: use apenas em ambiente descartável. A reversão do schema usa `RESTRICT` para não excluir tabelas que venham a ser adicionadas. As versões ficam em `public.schema_migrations`. Se uma migration falhar e ficar marcada como `dirty`, confira o SQL e o estado do banco antes de corrigir a versão. Não há reset automático.
+
+## Operações financeiras
+
+As operações de carteira exigem token de `internal-service`. O envio de apostas exige token do provedor informado em `providerId`, inclusive nos replays. Valores externos usam strings com exatamente duas casas, somente BRL, sem sinal negativo, expoente ou arredondamento. Zeros à esquerda são normalizados antes do hash.
+
+```sh
+INTERNAL_TOKEN=$(scripts/token.sh internal-service)
+PROVIDER_TOKEN=$(scripts/token.sh provider-a)
+
+curl --fail-with-body http://localhost:8080/wallets \
+  -H "Authorization: Bearer $INTERNAL_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"playerId":"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1","initialBalance":{"amount":"100.00","currency":"BRL"}}'
+```
+
+Copie o `id` retornado para `WALLET_ID` e envie a operação. A carteira desse exemplo só pode ser aberta uma vez por jogador/moeda; use outro UUID para repetir a abertura.
+
+```sh
+WALLET_ID='<id retornado>'
+curl --fail-with-body http://localhost:8080/wagering/transactions \
+  -H "Authorization: Bearer $PROVIDER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: provider-a:bet-1' \
+  -d "{\"providerId\":\"provider-a\",\"externalTransactionId\":\"bet-1\",\"playerId\":\"0192f28f-5dc0-7d58-bdb2-814ad6a0f4a1\",\"walletId\":\"$WALLET_ID\",\"roundId\":\"round-1\",\"gameId\":\"game-1\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}"
+
+curl --fail-with-body "http://localhost:8080/wallets/$WALLET_ID" \
+  -H "Authorization: Bearer $INTERNAL_TOKEN"
+```
+
+O saldo fica em `75.00`. Repetir a aposta retorna o mesmo resultado com `idempotentReplay: true`, mesmo depois de outras movimentações ou reinicialização. Outra chave para a mesma operação, ou outro conteúdo para a mesma chave, retorna conflito. Renove os tokens quando expirarem (60 segundos).
+
+`WIN` credita valor positivo. `LOSS` exige `0.00`, não muda saldo/versão e não cria ledger. `REFUND` e `ROLLBACK` exigem `referenceExternalTransactionId` e valor integral da referência. `OPENING` é exclusivo da abertura interna. Para uma reversão, use novos identificadores/chave, mantenha os metadados da aposta e acrescente a referência externa ao corpo.
+
+Referências ausentes ou ainda pendentes retornam `202` e ficam persistidas em `PENDING_REFERENCE`. Um worker integrado ao Fx tenta resolver a dependência com backoff exponencial, até 12 tentativas de resolução ou 24 horas. Reenviar o mesmo pedido consulta o estado atualizado; não antecipa o retry. O worker retoma pendências após reinicialização.
+
+| Situação | HTTP / corpo |
+| --- | --- |
+| Carteira criada | `201`, carteira com `version: 1` |
+| Carteira consultada | `200`, carteira atual |
+| Operação processada ou replay processado | `200`, `transactionId`, `status`, `balance`, `idempotentReplay` |
+| Referência pendente | `202`, mesmo formato com `status: PENDING_REFERENCE`; saldo atual sem movimentação |
+| Rejeição definitiva ou replay rejeitado | `422`, mesmo formato com `failureCode` e saldo persistido |
+| Entrada inválida, inclusive chave ausente | `400`, `{"error":"invalid_input"}` |
+| Conflito de carteira/chave/identidade externa | `409`, `{"error":"conflict"}` |
+| Carteira inexistente | `404`, `{"error":"wallet_not_found"}` |
+| Token ausente/inválido ou permissão insuficiente | `401` / `403` |
+| Falha transitória ou timeout | `503`, `{"error":"temporarily_unavailable"}`, `Retry-After: 1`; reenvie a mesma chave |
+
+Rejeições financeiras são terminais e auditáveis. Os códigos são `INSUFFICIENT_FUNDS`, `REVERSAL_INSUFFICIENT_FUNDS`, `BALANCE_OVERFLOW`, `INVALID_REFERENCE`, `REFERENCE_MISMATCH`, `INVALID_REFERENCE_KIND`, `REFERENCE_AMOUNT_MISMATCH`, `REFERENCE_NOT_PROCESSED`, `ALREADY_REVERSED` e `REFERENCE_NOT_FOUND`. A política detalhada está em [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## Autenticação
 
@@ -176,6 +225,15 @@ go test -tags=integration -race -count=1 -timeout=3m ./...
 
 Os testes de integração cobrem migrations, configuração das filas e da DLQ, autenticação, isolamento de provedores, expiração de tokens, falhas de inicialização, readiness e encerramento com requisições em andamento. O teste de expiração leva cerca de um minuto.
 
+Também cobrem abertura, operações financeiras, replays após novas movimentações e troca de conexões, 50 duplicatas concorrentes, duas apostas de 80.00 sobre 100.00, independência entre carteiras, reversões, expiração de referências, workers concorrentes e rollback integral quando a gravação da outbox falha. Um teste HTTP usa tokens reais e reinicia a aplicação Fx para verificar retomada automática. As proteções do banco são testadas com SQL direto.
+
+Para executar somente os novos testes financeiros:
+
+```sh
+go test -tags=integration -race -count=1 -timeout=3m ./internal/wagering
+go test -tags=integration -race -count=1 -timeout=3m ./integration -run TestFinancialHTTPAndWorkerLifecycle
+```
+
 As migrations são testadas em um banco temporário. A conta precisa de permissão para criar e excluir esse banco; a configuração local já permite isso. Use um ambiente descartável. Para mudar os endereços dos testes, defina `TEST_DATABASE_URL`, `TEST_OIDC_ISSUER_URL`, `TEST_OIDC_BACKCHANNEL_URL` e `TEST_SQS_ENDPOINT`.
 
 ### Recuperação de dependências
@@ -191,8 +249,8 @@ Para conferir o encerramento por SIGTERM, execute `docker compose stop app` e co
 
 ## O que falta
 
-As rotas `/wallets` e `/wagering/transactions` ainda retornam `404`. A próxima etapa é implementar dinheiro, carteiras, tabelas financeiras e processamento de apostas, com ledger, idempotência e outbox na mesma transação.
+As três primeiras etapas de [MILESTONES.md](MILESTONES.md) estão implementadas. Faltam consultas de transação, paginação do ledger, reconciliação, consumidor SQS, tratamento transacional da inbox, publicador da outbox, métricas financeiras e logs de rastreamento por operação. As tabelas de inbox/outbox já existem, mas não há consumo nem publicação de eventos.
 
-Também ficam pendentes os consumidores e publicadores SQS, inbox, recuperação de operações, testes financeiros com múltiplas instâncias e simulações de falha entre commit e publicação. As futuras rotas precisam aplicar autenticação e autorização também nas consultas e nos replays.
+Também faltam a demonstração com três processos independentes, interrupções reais entre commit e remoção/publicação e políticas IAM do broker. Os testes atuais verificam concorrência no PostgreSQL com goroutines e conexões independentes; isso ainda não equivale à demonstração distribuída completa. As futuras consultas precisam aplicar autorização por provedor. Enquanto elas não existem, reenvie a operação com a mesma chave para consultar sua conclusão.
 
 O ambiente usa HTTP e credenciais locais. TLS, gestão de credenciais e políticas IAM do broker ficam para a configuração de produção; as credenciais `test` do LocalStack não validam essas políticas.
