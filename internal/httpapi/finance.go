@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"junglegaming/challenge/internal/auth"
@@ -33,7 +34,7 @@ func financeError(w http.ResponseWriter, err error) {
 	case errors.Is(err, wagering.ErrConflict):
 		status, code = http.StatusConflict, "conflict"
 	case errors.Is(err, wagering.ErrNotFound):
-		status, code = http.StatusNotFound, "wallet_not_found"
+		status, code = http.StatusNotFound, "not_found"
 	}
 	if status == http.StatusServiceUnavailable {
 		w.Header().Set("Retry-After", "1")
@@ -66,6 +67,57 @@ func FinanceHandler(a *auth.Authenticator, s *wagering.Service, timeout time.Dur
 		}
 		respond(w, http.StatusOK, wallet)
 	})))
+	mux.Handle("GET /wallets/{walletId}/ledger", auth.RequireInternal(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := 50
+		if raw := r.URL.Query().Get("limit"); raw != "" {
+			var err error
+			limit, err = strconv.Atoi(raw)
+			if err != nil {
+				financeError(w, domain.ErrInvalid)
+				return
+			}
+		}
+		result, err := s.Ledger(r.Context(), r.PathValue("walletId"), r.URL.Query().Get("cursor"), limit)
+		if err != nil {
+			financeError(w, err)
+			return
+		}
+		respond(w, 200, result)
+	})))
+	mux.Handle("POST /wallets/{walletId}/reconciliation", auth.RequireInternal(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		result, err := s.Reconcile(r.Context(), r.PathValue("walletId"))
+		if err != nil {
+			financeError(w, err)
+			return
+		}
+		respond(w, 200, result)
+	})))
+	lookup := func(external bool) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			identity, ok := auth.FromContext(r.Context())
+			if !ok || identity.Role != "provider" {
+				respond(w, 403, map[string]string{"error": "forbidden"})
+				return
+			}
+			provider := identity.ProviderID
+			id := r.PathValue("transactionId")
+			if external {
+				if r.PathValue("providerId") != provider {
+					respond(w, 403, map[string]string{"error": "forbidden"})
+					return
+				}
+				id = r.PathValue("externalTransactionId")
+			}
+			result, err := s.Transaction(r.Context(), provider, id, external)
+			if err != nil {
+				financeError(w, err)
+				return
+			}
+			respond(w, 200, result)
+		}
+	}
+	mux.HandleFunc("GET /wagering/transactions/{transactionId}", lookup(false))
+	mux.HandleFunc("GET /providers/{providerId}/wagering/transactions/{externalTransactionId}", lookup(true))
 	mux.HandleFunc("POST /wagering/transactions", func(w http.ResponseWriter, r *http.Request) {
 		id, ok := auth.FromContext(r.Context())
 		if !ok || id.Role != "provider" {

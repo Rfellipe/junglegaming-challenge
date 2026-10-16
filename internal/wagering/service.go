@@ -255,6 +255,17 @@ func findReplay(ctx context.Context, tx pgx.Tx, r Request, key, hash string) (*R
 }
 
 func (s *Service) Process(ctx context.Context, r Request, key string) (Result, error) {
+	return s.process(ctx, r, key, "", "")
+}
+
+// ProcessMessage commits inbox completion in the same transaction as processing.
+func (s *Service) ProcessMessage(ctx context.Context, r Request, key, messageID, hash string) (Result, error) {
+	if !validText(messageID) || len(hash) != 64 {
+		return Result{}, domain.ErrInvalid
+	}
+	return s.process(ctx, r, key, messageID, hash)
+}
+func (s *Service) process(ctx context.Context, r Request, key, messageID, messageHash string) (Result, error) {
 	if err := r.Validate(key); err != nil {
 		return Result{}, err
 	}
@@ -268,12 +279,36 @@ func (s *Service) Process(ctx context.Context, r Request, key string) (Result, e
 		return Result{}, err
 	}
 	defer tx.Rollback(context.Background())
+	if messageID != "" {
+		_, err = tx.Exec(ctx, `INSERT INTO wagering.inbox(consumer_name,message_id,payload_hash,received_at) VALUES('wagering-v1',$1,$2,now()) ON CONFLICT (consumer_name,message_id) DO UPDATE SET deliveries=wagering.inbox.deliveries+1`, messageID, messageHash)
+		if err != nil {
+			return Result{}, err
+		}
+		var persisted string
+		if err = tx.QueryRow(ctx, `SELECT payload_hash FROM wagering.inbox WHERE consumer_name='wagering-v1' AND message_id=$1 FOR UPDATE`, messageID).Scan(&persisted); err != nil {
+			return Result{}, err
+		}
+		if persisted != messageHash {
+			return Result{}, ErrConflict
+		}
+	}
+	finish := func(result Result) (Result, error) {
+		if messageID != "" {
+			if _, err := tx.Exec(ctx, `UPDATE wagering.inbox SET completed_at=COALESCE(completed_at,now()) WHERE consumer_name='wagering-v1' AND message_id=$1`, messageID); err != nil {
+				return Result{}, err
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return Result{}, classify(err)
+		}
+		return result, nil
+	}
 	// Check persisted identity before validating a changed wallet/player. A reused
 	// key must conflict even if the replacement wallet does not exist.
 	if replay, err := findReplay(ctx, tx, r, key, hash); err != nil {
 		return Result{}, err
 	} else if replay != nil {
-		return *replay, nil
+		return finish(*replay)
 	}
 	// This is the sole financial coordination lock, shared across all processes.
 	w, err := scanWallet(tx.QueryRow(ctx, `SELECT `+walletColumns+` FROM wagering.wallets WHERE id=$1 FOR UPDATE`, r.WalletID))
@@ -297,7 +332,7 @@ func (s *Service) Process(ctx context.Context, r Request, key string) (Result, e
 		if replay == nil {
 			return Result{}, ErrConflict
 		}
-		return *replay, nil
+		return finish(*replay)
 	}
 	o := operation{id: id, key: key, hash: hash, request: r, status: domain.Pending, created: now, updated: now}
 	expiry := now.Add(24 * time.Hour)
@@ -305,10 +340,7 @@ func (s *Service) Process(ctx context.Context, r Request, key string) (Result, e
 	if err = s.apply(ctx, tx, &o, w, now, false); err != nil {
 		return Result{}, err
 	}
-	if err = tx.Commit(ctx); err != nil {
-		return Result{}, classify(err)
-	}
-	return o.result(false, w.Balance()), nil
+	return finish(o.result(false, w.Balance()))
 }
 
 func (s *Service) apply(ctx context.Context, tx pgx.Tx, o *operation, w *domain.Wallet, now time.Time, retry bool) error {

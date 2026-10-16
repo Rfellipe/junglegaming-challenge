@@ -197,7 +197,7 @@ func TestMigrations(t *testing.T) {
 	}
 	var version int
 	var dirty bool
-	if err := conn.QueryRow(ctx, "SELECT version, dirty FROM public.schema_migrations").Scan(&version, &dirty); err != nil || version != 2 || dirty {
+	if err := conn.QueryRow(ctx, "SELECT version, dirty FROM public.schema_migrations").Scan(&version, &dirty); err != nil || version != 3 || dirty {
 		t.Fatal("migration state invalid", err)
 	}
 }

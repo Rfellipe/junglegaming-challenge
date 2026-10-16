@@ -2,11 +2,11 @@
 
 ## Organização e ciclo de vida
 
-O Uber Fx monta configuração, PostgreSQL, SQS, autenticação, serviço financeiro, worker de referências e HTTP por construtores. O domínio em `internal/domain` não depende de Fx, HTTP, SQS ou pgx. `internal/wagering` coordena persistência e casos de uso; `internal/httpapi` aplica identidade, limites de entrada e contratos HTTP.
+O Uber Fx monta configuração, PostgreSQL, SQS, autenticação, serviço financeiro, workers de referências, inbox/outbox e HTTP por construtores. O domínio em `internal/domain` não depende de Fx, HTTP, SQS ou pgx. `internal/wagering` coordena persistência e casos de uso; `internal/httpapi` aplica identidade, limites de entrada e contratos HTTP.
 
 A configuração é lida uma vez e validada antes da inicialização. As URLs do PostgreSQL e do emissor OIDC são obrigatórias. As chamadas externas usam contextos com timeout, e o servidor HTTP limita leitura de cabeçalhos, leitura, escrita e tempo ocioso.
 
-A API só começa a aceitar conexões depois das verificações de PostgreSQL, SQS e descoberta OIDC. No SIGTERM, o Fx para novas requisições e aguarda as que estão em andamento até o prazo configurado. Se o prazo acabar, fecha as conexões HTTP. Depois cancela e aguarda o worker de referências, libera as conexões ociosas de OIDC/SQS e fecha o pool do banco. Se a inicialização falhar, os recursos parcialmente abertos são fechados e o Fx desfaz os hooks concluídos.
+A API só começa a aceitar conexões depois das verificações de PostgreSQL, SQS e descoberta OIDC. No SIGTERM, o Fx para novas requisições e aguarda as que estão em andamento até o prazo configurado. Se o prazo acabar, fecha as conexões HTTP. Os hooks cancelam e aguardam os workers antes de fechar SQS e PostgreSQL; a camada OIDC também libera suas conexões ociosas. Se a inicialização falhar, os recursos parcialmente abertos são fechados e o Fx desfaz os hooks concluídos.
 
 Os logs são JSON, com `slog` e o adaptador do Fx. Não incluem strings de conexão, credenciais, tokens ou payloads financeiros. As respostas públicas de saúde mostram apenas o estado das dependências.
 
@@ -28,7 +28,7 @@ O middleware aceita JWTs assinados com RS256 e verifica emissor, audiência, exp
 
 O emissor local é `http://localhost:8081/realms/jungle`. Dentro do Compose, um transporte HTTP do cliente OIDC troca apenas a origem da requisição por `http://keycloak:8080`. Assim, descoberta e JWKS funcionam na rede dos containers sem desabilitar a validação do emissor. Fora do Docker, o backchannel fica vazio. As consultas de JWKS também têm timeout.
 
-Os tokens duram 60 segundos para permitir testes de expiração real. As rotas de carteira exigem serviço interno. A entrada financeira exige um provedor autenticado e compara seu `provider_id` com o corpo antes de chamar o caso de uso, incluindo replays. Não há endpoint de leitura de transações nesta etapa; consultas futuras deverão repetir o isolamento por provedor.
+Os tokens duram 60 segundos para permitir testes de expiração real. As rotas de carteira exigem serviço interno. A entrada financeira exige um provedor autenticado e compara seu `provider_id` com o corpo antes de chamar o caso de uso, incluindo replays. As duas consultas de transações filtram o provedor no SQL, inclusive ao buscar pelo ID interno.
 
 ## Dinheiro e entidades
 
@@ -50,7 +50,7 @@ As verificações do saldo por soma têm custo proporcional ao histórico da car
 
 ## Idempotência e estados
 
-O hash é SHA-256 do JSON gerado por mapas Go, com chaves ordenadas lexicograficamente, incluindo o mapa interno de Money. Campos: providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money (amount/currency) e referenceExternalTransactionId. Referência ausente é string vazia no hash. UUIDs são minúsculos e Money usa sua forma decimal normalizada; chave de idempotência e metadados de transporte ficam fora do hash. Esse contrato deverá ser usado sem alterações pelo futuro consumidor SQS.
+O hash é SHA-256 do JSON gerado por mapas Go, com chaves ordenadas lexicograficamente, incluindo o mapa interno de Money. Campos: providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money (amount/currency) e referenceExternalTransactionId. Referência ausente é string vazia no hash. UUIDs são minúsculos e Money usa sua forma decimal normalizada; chave de idempotência e metadados de transporte ficam fora do hash. O consumidor SQS usa esse mesmo contrato.
 
 Chave, identidade externa e hash precisam coincidir para replay. Reutilizar chave com conteúdo diferente, reutilizar identidade externa com outra chave, ou cruzar duas identidades já existentes resulta em conflito. O resultado terminal armazena saldo e failureCode; o replay devolve esses dados originais, independentemente do saldo atual.
 
@@ -89,7 +89,7 @@ Todos esses resultados são definitivos para aquela operação: replay não tent
 
 Construtores concretos fixam tipo e versão 1 dos eventos WagerTransactionProcessed, WagerTransactionRejected, WagerTransactionPendingReference e WalletBalanceChanged. Os envelopes usam IDs UUID estáveis, aggregateId, correlationId igual ao ID da operação, UTC/RFC 3339 e Money em strings; causationId é opcional e omitido. Eventos de abertura omitem metadados externos inaplicáveis. WalletBalanceChanged inclui direção, valor, saldo anterior/posterior e versão da carteira. LOSS emite apenas o evento de processamento.
 
-O JSON é serializado uma vez e gravado como snapshot imutável na transação financeira. Não há publicação SQS nesta etapa. As colunas de tentativas, próximo envio, publicação e lease ficam prontas para o publisher do próximo milestone; a inbox também existe apenas como schema.
+O JSON é serializado uma vez e gravado como snapshot imutável na transação financeira. O publisher publica somente linhas confirmadas, com claims atômicos SKIP LOCKED, leases de 15 segundos e confirmação condicionada ao token. Publicação fora da transação evita manter locks financeiros durante I/O. Reenvios preservam eventId e snapshot; consumidores deduplicam por eventId. A inbox é gravada e concluída no mesmo pgx.Tx financeiro, inclusive para replays e pendências.
 
 ## Filas e saúde
 
@@ -107,8 +107,12 @@ A configuração local passou a validar conexões antes de reutilizá-las, por u
 
 ## Próxima etapa e limitações
 
-A estrutura atual processa as cinco operações externas por HTTP e retoma referências pendentes. Consultas de transação, paginação do ledger e reconciliação ficam para a etapa 4. Consumidor SQS, inbox transacional, publicador da outbox e recuperação de publicação ficam para a etapa 5. A conclusão futura da inbox deve compartilhar o mesmo pgx.Tx do caso de uso financeiro.
+As etapas 1–6 estão implementadas. Consultas por ID interno e externo filtram provider_id no SQL. Ledger usa cursor vinculado à carteira e wallet_version crescente, único por carteira. Reconciliação usa uma única instrução SQL para obter visão MVCC consistente e calcular armazenado menos créditos líquidos, sem mutações.
 
-Os testes usam PostgreSQL, Keycloak e LocalStack reais, além de testes puros do domínio. Cobrem concorrência de apostas e reversões, SQL inválido, erro injetado na outbox, TTL, workers concorrentes e reinício da aplicação Fx. Ainda faltam três processos independentes, interrupção abrupta nos pontos de publicação/remoção SQS, métricas financeiras e logs correlacionados por operação.
+O SQS compartilha Process com HTTP. A inbox bloqueia por (consumer_name,message_id), valida hash SHA-256 do envelope tipado normalizado e registra conclusão junto com domínio e outbox. Alterações de conteúdo sob a mesma identidade retornam conflito e seguem para DLQ. Entregas confirmadas incrementam deliveries. Tentativas de processamento têm prazo de 5 segundos, visibilidade de 30 segundos e backoff transitório de 2 a 16 segundos; mensagens permanentes aguardam 2 segundos. Redrive ocorre após cinco recebimentos. Publisher usa backoff exponencial até 256 segundos, sem descartar eventos.
 
-A configuração local usa portas expostas apenas na interface local e credenciais de exemplo. TLS, armazenamento e rotação de credenciais, permissões restritas no banco e políticas IAM do broker ficam pendentes para produção. O LocalStack não comprova essas regras de autorização.
+O Fx encerra HTTP e workers antes de fechar clientes e banco. Cancelamento desfaz transações não confirmadas; falhas de DeleteMessage deixam mensagens recuperáveis. Leases expiram após interrupção abrupta. Output usa grupo por carteira e deduplicação por eventId; publishers concorrentes não garantem ordenação financeira de eventos. O contrato é pelo menos uma vez.
+
+A integração usa três processos independentes, tokens reais e barreiras injetadas exclusivamente no teste para SIGKILL nos pontos de commit, claim e publicação. PostgreSQL e LocalStack verificam efeitos, inbox, leases, retries e DLQ. Veja scripts/check-distributed.sh e README.md para reprodução. Métricas financeiras e logs correlacionados completos permanecem na etapa 7.
+
+Os modelos IAM e scripts/setup-broker-access.sh provisionam produtor confiável e worker com permissões distintas. LocalStack não comprova autorização IAM. A fila compartilhada pressupõe produtores confiáveis; providerId do corpo não é autenticado por IAM. Para produtores externos não confiáveis, exigir gateway autenticado ou filas por provedor. Produção também exige TLS, gestão de credenciais e permissões restritas no banco.

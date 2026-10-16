@@ -16,6 +16,8 @@ import (
 
 var Module = fx.Module("sqs", fx.Provide(New))
 
+var WorkersModule = fx.Module("sqs-workers", fx.Invoke(startWorkers))
+
 type Client struct {
 	api   *sqs.Client
 	names []string

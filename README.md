@@ -2,7 +2,7 @@
 
 Serviço de processamento de apostas com Go e Uber Fx. O enunciado está em [CHALLENGE.md](CHALLENGE.md) e as decisões técnicas em [ARCHITECTURE.md](ARCHITECTURE.md).
 
-Estão implementados o ambiente local, autenticação, saúde, domínio financeiro, abertura e consulta de carteiras, processamento HTTP dos cinco tipos externos, ledger, idempotência persistente e retomada de referências pendentes. Os eventos são gravados na outbox junto com as alterações financeiras; consumo e publicação SQS entram na próxima etapa.
+Estão implementados o ambiente local, autenticação, saúde, domínio financeiro, abertura e consulta de carteiras, processamento HTTP dos cinco tipos externos, ledger, idempotência persistente e retomada de referências pendentes. Também estão implementados consultas isoladas por provedor, paginação do ledger, reconciliação, inbox transacional, consumo SQS e publicação recuperável da outbox.
 
 ## Executar o projeto
 
@@ -103,7 +103,7 @@ docker compose up --detach app
 
 Fora do Docker, os comandos são `go run ./cmd/migrate up` e `go run ./cmd/migrate down`, com as variáveis de ambiente carregadas.
 
-A primeira migration cria o schema `wagering`; a segunda cria as tabelas financeiras, inbox, outbox e proteções do banco. Reverter a segunda remove essas tabelas e seus dados: use apenas em ambiente descartável. A reversão do schema usa `RESTRICT` para não excluir tabelas que venham a ser adicionadas. As versões ficam em `public.schema_migrations`. Se uma migration falhar e ficar marcada como `dirty`, confira o SQL e o estado do banco antes de corrigir a versão. Não há reset automático.
+A primeira migration cria o schema `wagering`; a segunda cria as tabelas financeiras, inbox, outbox e proteções do banco. Reverter a segunda remove essas tabelas e seus dados: use apenas em ambiente descartável. A reversão do schema usa `RESTRICT` para não excluir tabelas que venham a ser adicionadas. A terceira migration adiciona o contador de entregas da inbox. As versões ficam em `public.schema_migrations`. Se uma migration falhar e ficar marcada como `dirty`, confira o SQL e o estado do banco antes de corrigir a versão. Não há reset automático.
 
 ## Operações financeiras
 
@@ -249,8 +249,57 @@ Para conferir o encerramento por SIGTERM, execute `docker compose stop app` e co
 
 ## O que falta
 
-As três primeiras etapas de [MILESTONES.md](MILESTONES.md) estão implementadas. Faltam consultas de transação, paginação do ledger, reconciliação, consumidor SQS, tratamento transacional da inbox, publicador da outbox, métricas financeiras e logs de rastreamento por operação. As tabelas de inbox/outbox já existem, mas não há consumo nem publicação de eventos.
+As etapas 1–6 de [MILESTONES.md](MILESTONES.md) estão implementadas. Métricas financeiras e logs correlacionados completos permanecem na etapa 7; a revisão final de entrega permanece na etapa 8.
 
-Também faltam a demonstração com três processos independentes, interrupções reais entre commit e remoção/publicação e políticas IAM do broker. Os testes atuais verificam concorrência no PostgreSQL com goroutines e conexões independentes; isso ainda não equivale à demonstração distribuída completa. As futuras consultas precisam aplicar autorização por provedor. Enquanto elas não existem, reenvie a operação com a mesma chave para consultar sua conclusão.
+O ambiente usa HTTP e credenciais locais. TLS, gestão/rotação de credenciais e validação de IAM na AWS continuam sendo responsabilidades de produção. LocalStack não comprova isolamento IAM.
 
-O ambiente usa HTTP e credenciais locais. TLS, gestão de credenciais e políticas IAM do broker ficam para a configuração de produção; as credenciais `test` do LocalStack não validam essas políticas.
+## Consultas e contrato HTTP (etapa 4)
+
+As consultas `GET /wagering/transactions/{transactionId}` e `GET /providers/{providerId}/wagering/transactions/{externalTransactionId}` exigem token do provedor proprietário. A primeira filtra o provedor no SQL e responde 404 para IDs de outro provedor; a segunda responde 403 se o provedor da rota difere do token. O corpo inclui os campos do pedido, transactionId, status, balance, failureCode quando aplicável, idempotentReplay=false, createdAt e updatedAt. Para pendências sem resultado financeiro, balance é zero; não representa saldo de processamento confirmado.
+
+`GET /wallets/{walletId}/ledger?limit=50&cursor=...` exige serviço interno e devolve `{"entries":[...],"nextCursor":"..."}`. Cada entrada contém id, transactionId, direction, money, balanceBefore, balanceAfter, walletVersion e createdAt. O limite é 1–200; o cursor é opaco, vinculado à carteira e ordenado por walletVersion crescente. Ausência de nextCursor indica fim da página atual; lançamentos futuros podem surgir depois. Passe o cursor sem modificá-lo.
+
+`POST /wallets/{walletId}/reconciliation` exige serviço interno. Devolve walletId, storedBalance, calculatedBalance, difference (armazenado menos calculado), consistent e checkedEntries. Uma única instrução SQL usa o mesmo snapshot para carteira e lançamentos, incluindo OPENING. Não altera registros.
+
+| Situação | HTTP | Corpo |
+| --- | --- | --- |
+| Processado ou replay concluído | 200 | transactionId, status, balance, idempotentReplay |
+| Referência aguardando | 202 | mesmo resultado, status=PENDING_REFERENCE |
+| Rejeição de negócio | 422 | mesmo resultado, status=REJECTED e failureCode |
+| JSON, IDs, valores ou cursor inválidos | 400 | `{"error":"invalid_input"}` |
+| Chave, identidade externa ou carteira em conflito | 409 | `{"error":"conflict"}` |
+| Recurso ausente ou transação invisível | 404 | `{"error":"not_found"}` |
+| Token ausente/inválido | 401 | erro de autenticação |
+| Papel/provedor não autorizado | 403 | `{"error":"forbidden"}` |
+| Falha transitória | 503 | `{"error":"temporarily_unavailable"}` e Retry-After: 1 |
+
+Uma consulta bem-sucedida retorna 200 mesmo para uma transação rejeitada ou pendente. O POST conserva a chave enviada e o saldo original nos replays de operações concluídas. Os códigos de negócio estão em ARCHITECTURE.md.
+
+## Inbox, publicação e credenciais (etapa 5)
+
+Envie o envelope de CHALLENGE.md com type=WagerTransactionRequested, messageId, occurredAt RFC3339 e data contendo o pedido financeiro mais idempotencyKey. JSON desconhecido, envelopes maiores que 16 KiB e valores inválidos são retidos para DLQ. messageId identifica a inbox `wagering-v1`; SHA-256 do envelope tipado serializado detecta mudanças de conteúdo, chave e metadados. A formatação JSON não afeta o hash. Reenvie exatamente o mesmo envelope nas reentregas.
+
+A inbox, sua conclusão, o resultado financeiro e eventos compartilham o commit. Rejeições e referências pendentes confirmadas permitem DeleteMessage; falhas não confirmadas não permitem remoção. O contador deliveries registra reentregas duráveis. Cada tentativa tem prazo de 5 segundos e visibilidade de 30 segundos. Retry transitório usa 2, 4, 8 e 16 segundos (teto 16); mensagens inválidas/conflitantes aguardam 2 segundos. A política de redrive envia à DLQ após cinco recebimentos. Não há confirmação de inbox para mensagens inválidas.
+
+Cada processo tem consumidor e publisher. O publisher reivindica uma linha com SKIP LOCKED e lease de 15 segundos; publica fora da transação e confirma apenas com seu lease_token. Falhas persistem backoff exponencial com teto de 256 segundos; eventos continuam recuperáveis sem limite de tentativas. A saída usa o envelope versionado de ARCHITECTURE.md, MessageGroupId=walletId e MessageDeduplicationId=eventId. Os produtores devem usar grupo por carteira e ID de deduplicação estável por mensagem. Para testar reentrega da aplicação dentro dos cinco minutos de deduplicação FIFO, use outro ID de broker preservando o envelope.
+
+A publicação é pelo menos uma vez: interrupção após SendMessage pode causar reenvio. Consumidores de saída precisam deduplicar por eventId e não presumir ordem financeira entre publishers. FIFO pode suprimir uma republicação no intervalo de deduplicação. No SIGTERM os workers param de receber, cancelam a tentativa e liberam visibilidade em caso de erro; commit concluído permanece seguro para reentrega. Leases abandonados expiram.
+
+Para provisionar usuários e políticas locais de produtor e worker:
+
+```sh
+./scripts/setup-broker-access.sh
+./scripts/setup-broker-access.sh wagering-producer /tmp/jungle-producer-credentials.json
+```
+
+O segundo comando cria uma chave e grava a resposta com modo 600. Os modelos em deploy/aws restringem o produtor a SendMessage/GetQueueUrl na entrada e o worker a leitura/remoção da entrada e envio à saída. Para AWS, substitua região/conta e associe essas permissões a roles com credenciais temporárias. O acesso de entrada é reservado a produtores confiáveis: IAM na fila compartilhada não valida o providerId no JSON. Não conceda envio direto a provedores não confiáveis sem gateway autenticado ou filas isoladas. As credenciais test usadas pelo Compose não validam IAM; o script demonstra o provisionamento, e os testes financeiros não alegam verificar autorização AWS.
+
+## Três processos e recuperação (etapa 6)
+
+```sh
+./scripts/check-distributed.sh
+# Ou, com as dependências já prontas:
+go test -tags=integration -race -count=1 -timeout=5m ./...
+```
+
+O runner cria banco e filas temporários e inicia três processos reais com portas efêmeras distintas e pools independentes. Usa tokens reais do Keycloak e pausa/retoma brevemente o container LocalStack para comprovar recuperação da outbox durante indisponibilidade do broker. Exercita 50 replays, duas apostas concorrentes de 80.00, isolamento de locks, HTTP/SQS, reentrega comprovada pelo contador da inbox, poison/DLQ, reinício e referências. Barreiras injetadas apenas no binário de testes interrompem o processo após commit/antes de delete, após claim/antes de SendMessage e após SendMessage/antes de confirmação. O teste envia SIGKILL ao processo que atingiu a barreira e aguarda recuperação por outro publisher após expirar o lease. Confere saldo, ledger, resultado persistido, inbox e outbox. Não há endpoint ou variável de aplicação que ative essas barreiras.

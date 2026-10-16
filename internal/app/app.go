@@ -19,7 +19,7 @@ func Modules() fx.Option {
 	return fx.Options(
 		fx.Provide(func() *slog.Logger { return slog.New(slog.NewJSONHandler(os.Stdout, nil)) }),
 		fx.WithLogger(func(l *slog.Logger) fxevent.Logger { return &fxevent.SlogLogger{Logger: l} }),
-		postgres.Module, messaging.Module, auth.Module, wagering.Module,
+		postgres.Module, messaging.Module, auth.Module, wagering.Module, messaging.WorkersModule,
 		httpapi.Module,
 	)
 }
